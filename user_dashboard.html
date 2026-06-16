@@ -1,0 +1,180 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Two-Factor Authentication Demo</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        text-align: center;
+        padding: 20px;
+      }
+      video {
+        border: 2px solid #333;
+        border-radius: 10px;
+        margin: 20px;
+      }
+      button {
+        padding: 10px 30px;
+        font-size: 18px;
+        background-color: #007bff;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      button:disabled {
+        background-color: #aaa;
+        cursor: not-allowed;
+      }
+      .granted {
+        color: green;
+        font-size: 24px;
+        font-weight: bold;
+        margin: 20px;
+      }
+      .denied {
+        color: red;
+        font-size: 24px;
+        font-weight: bold;
+        margin: 20px;
+      }
+      .details {
+        background-color: #f0f0f0;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 20px auto;
+        width: 50%;
+        text-align: left;
+        font-family: monospace;
+      }
+      select {
+        padding: 10px;
+        font-size: 16px;
+        margin: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🔐 Two-Factor Authentication System</h1>
+    <h3>Face Recognition + RF Fingerprinting</h3>
+
+    <video id="video" width="640" height="480" autoplay muted></video>
+    <br />
+
+    <!-- User list is populated dynamically from the /users endpoint -->
+    <select id="userSelect">
+      <option value="">Loading users...</option>
+    </select>
+
+    <button id="authBtn">🔍 Authenticate</button>
+
+    <div id="result"></div>
+
+    <script>
+      const API_URL = "http://localhost:5000";
+      const video = document.getElementById("video");
+
+      // Start camera
+      navigator.mediaDevices
+        .getUserMedia({ video: true })
+        .then((stream) => (video.srcObject = stream))
+        .catch((err) => {
+          console.error(err);
+          document.getElementById("result").innerHTML =
+            '<div class="denied">Camera error: ' + err.message + "</div>";
+        });
+
+      // Populate user dropdown dynamically
+      async function loadUsers() {
+        try {
+          const res = await fetch(`${API_URL}/users`);
+          const users = await res.json();
+          const select = document.getElementById("userSelect");
+          select.innerHTML = "";
+          if (users.length === 0) {
+            select.innerHTML = '<option value="">No users enrolled</option>';
+            return;
+          }
+          users.forEach((u) => {
+            const opt = document.createElement("option");
+            opt.value = u.name;
+            opt.textContent = u.name;
+            select.appendChild(opt);
+          });
+        } catch (err) {
+          console.error("Failed to load users:", err);
+        }
+      }
+
+      loadUsers();
+
+      document.getElementById("authBtn").addEventListener("click", async () => {
+        const btn = document.getElementById("authBtn");
+        btn.disabled = true;
+        btn.textContent = "Authenticating...";
+
+        try {
+          // Small delay for camera to settle
+          await new Promise((r) => setTimeout(r, 300));
+
+          const canvas = document.createElement("canvas");
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          canvas.getContext("2d").drawImage(video, 0, 0);
+          const imageData = canvas.toDataURL("image/jpeg");
+
+          const claimedUser = document.getElementById("userSelect").value;
+          if (!claimedUser) {
+            alert("Please select a user first.");
+            return;
+          }
+
+          const response = await fetch(`${API_URL}/authenticate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              face_image: imageData,
+              claimed_user: claimedUser,
+            }),
+          });
+
+          const result = await response.json();
+
+          if (result.final_verdict === "GRANTED") {
+            document.getElementById("result").innerHTML = `
+              <div class="granted">✅ ACCESS GRANTED</div>
+              <div class="details">
+                <strong>📊 Authentication Details:</strong><br>
+                Phase 1 (Face): ${result.phase1.status}<br>
+                Face Similarity: ${(result.phase1.similarity * 100).toFixed(2)}%<br>
+                Phase 2 (RF): ${result.phase2.status}<br>
+                Device ID: ${result.phase2.device_id}<br>
+                <span style="color:green;">✓ Both factors verified successfully</span>
+              </div>`;
+          } else {
+            document.getElementById("result").innerHTML = `
+              <div class="denied">❌ ACCESS DENIED</div>
+              <div class="details">
+                <strong>📊 Authentication Details:</strong><br>
+                Phase 1 (Face): ${result.phase1?.status || "FAILED"}<br>
+                Face Similarity: ${result.phase1?.similarity != null ? (result.phase1.similarity * 100).toFixed(2) + "%" : "N/A"}<br>
+                Phase 2 (RF): ${result.phase2?.status || "SKIPPED"}<br>
+                ${result.phase2?.expected ? "Expected Device: " + result.phase2.expected + "<br>" : ""}
+                ${result.phase2?.predicted ? "Predicted Device: " + result.phase2.predicted + "<br>" : ""}
+                <span style="color:red;">✗ ${result.message || "Authentication failed"}</span>
+              </div>`;
+          }
+        } catch (err) {
+          document.getElementById("result").innerHTML =
+            '<div class="denied">Network error: ' + err.message + "</div>";
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "🔍 Authenticate";
+        }
+      });
+    </script>
+  </body>
+</html>

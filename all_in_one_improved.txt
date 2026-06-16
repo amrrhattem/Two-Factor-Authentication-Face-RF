@@ -1,0 +1,1081 @@
+# ============================================================
+# FILE 1: config.py
+# ============================================================
+
+import os
+
+# --- Paths ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, 'auth_system.db')
+RF_MODEL_PATH = os.path.join(BASE_DIR, 'rf_model_15features.pkl')
+LABEL_ENCODER_PATH = os.path.join(BASE_DIR, 'label_encoder_15features.pkl')
+ALL_FEATURES_PATH = os.path.join(BASE_DIR, 'Features', 'all_features.pkl')
+
+# --- Security ---
+ADMIN_TOKEN = os.environ.get('ADMIN_TOKEN', 'change-me-in-production')
+
+# --- Face Recognition ---
+FACE_SIMILARITY_THRESHOLD = 0.60
+FACE_MODEL_NAME = 'buffalo_l'
+FACE_DET_SIZE = (640, 640)
+
+# --- Server ---
+DEBUG = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+PORT = int(os.environ.get('PORT', 5000))
+
+
+# ============================================================
+# FILE 2: setup_database.py
+# ============================================================
+
+import sqlite3
+from config import DB_PATH
+
+
+def setup_database():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    # Users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        face_embedding BLOB,
+        device_id TEXT,
+        enrollment_date DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+
+    # Auth log table
+    c.execute('''CREATE TABLE IF NOT EXISTS auth_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        user_name TEXT,
+        face_score REAL,
+        device_id TEXT,
+        final_decision TEXT
+    )''')
+
+    # Migration: add columns if missing (safe, idempotent)
+    for column, col_type in [('device_id', 'TEXT'), ('face_score', 'REAL')]:
+        try:
+            c.execute(f"ALTER TABLE auth_log ADD COLUMN {column} {col_type}")
+            print(f"✅ Added {column} column to auth_log")
+        except sqlite3.OperationalError:
+            print(f"⚠️  {column} column already exists in auth_log")
+
+    conn.commit()
+    conn.close()
+    print("✅ Database ready:", DB_PATH)
+
+
+if __name__ == '__main__':
+    setup_database()
+
+
+# ============================================================
+# FILE 3: server.py  (Flask backend)
+# ============================================================
+
+import cv2
+import numpy as np
+import pickle
+import sqlite3
+from functools import wraps
+
+from insightface.app import FaceAnalysis
+from flask import Flask, request, jsonify, g
+from flask_cors import CORS
+import base64
+import joblib
+import os
+from datetime import datetime
+
+from config import (
+    DB_PATH, RF_MODEL_PATH, LABEL_ENCODER_PATH, ALL_FEATURES_PATH,
+    ADMIN_TOKEN, FACE_SIMILARITY_THRESHOLD, FACE_MODEL_NAME,
+    FACE_DET_SIZE, DEBUG, PORT
+)
+from setup_database import setup_database
+
+app = Flask(__name__)
+CORS(app)
+
+# --- Startup: ensure DB exists ---
+setup_database()
+
+# --- Load models once at startup ---
+print("Loading face model...")
+face_app = FaceAnalysis(name=FACE_MODEL_NAME)
+face_app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
+
+print("Loading RF model...")
+rf_model = joblib.load(RF_MODEL_PATH)
+rf_label_encoder = joblib.load(LABEL_ENCODER_PATH)
+
+print("Loading device features...")
+with open(ALL_FEATURES_PATH, 'rb') as f:
+    device_features_db = pickle.load(f)
+
+print(f"✅ Server ready. {len(device_features_db)} RF devices loaded.")
+
+
+# ============================================================
+# Database helpers (connection-per-request via Flask g)
+# ============================================================
+
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(error):
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
+
+
+def log_attempt(user_name, face_score, device_id, final_decision):
+    db = get_db()
+    db.execute(
+        "INSERT INTO auth_log (user_name, face_score, device_id, final_decision) VALUES (?, ?, ?, ?)",
+        (user_name, face_score, device_id, final_decision)
+    )
+    db.commit()
+    print(f"📝 Logged: {user_name} - {final_decision}")
+
+
+# ============================================================
+# Auth guard for admin endpoints
+# ============================================================
+
+def require_admin(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('X-Admin-Token', '')
+        if token != ADMIN_TOKEN:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+# ============================================================
+# Face helpers
+# ============================================================
+
+def get_face_embedding(frame):
+    faces = face_app.get(frame)
+    if len(faces) > 0:
+        return faces[0].embedding
+    return None
+
+
+def verify_face(face_embedding, stored_embedding, threshold=FACE_SIMILARITY_THRESHOLD):
+    norm = np.linalg.norm(face_embedding) * np.linalg.norm(stored_embedding)
+    if norm == 0:
+        return 0.0, False
+    similarity = float(np.dot(face_embedding, stored_embedding) / norm)
+    return similarity, similarity >= threshold
+
+
+def decode_image_from_base64(face_base64):
+    if ',' in face_base64:
+        face_base64 = face_base64.split(',')[1]
+    face_bytes = base64.b64decode(face_base64)
+    nparr = np.frombuffer(face_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+
+# ============================================================
+# Public endpoint: authenticate
+# ============================================================
+
+@app.route('/authenticate', methods=['POST'])
+def authenticate():
+    try:
+        data = request.json
+        face_base64 = data.get('face_image')
+        claimed_user = data.get('claimed_user')
+
+        if claimed_user == 'Unknown':
+            log_attempt('Unknown', None, None, 'DENIED')
+            return jsonify({
+                'final_verdict': 'DENIED',
+                'phase1': {'status': 'FAILED', 'similarity': 0},
+                'phase2': {'status': 'SKIPPED'},
+                'message': 'Unknown user - Access denied'
+            })
+
+        if not face_base64:
+            return jsonify({'error': 'No face image'}), 400
+
+        frame = decode_image_from_base64(face_base64)
+        if frame is None:
+            return jsonify({'error': 'Failed to decode image'}), 400
+
+        face_emb = get_face_embedding(frame)
+        if face_emb is None:
+            log_attempt(claimed_user, None, None, 'DENIED')
+            return jsonify({'error': 'No face detected'}), 400
+
+        db = get_db()
+        user = db.execute(
+            "SELECT face_embedding, device_id FROM users WHERE name = ?",
+            (claimed_user,)
+        ).fetchone()
+
+        if user is None:
+            log_attempt(claimed_user, None, None, 'DENIED')
+            return jsonify({'error': f'User {claimed_user} not found'}), 404
+
+        stored_emb = np.frombuffer(user['face_embedding'], dtype=np.float32)
+        face_similarity, face_match = verify_face(face_emb, stored_emb)
+
+        if not face_match:
+            log_attempt(claimed_user, face_similarity, None, 'DENIED')
+            return jsonify({
+                'final_verdict': 'DENIED',
+                'phase1': {'status': 'FAILED', 'similarity': face_similarity},
+                'phase2': {'status': 'SKIPPED'},
+                'message': f'Face verification failed (similarity: {face_similarity:.3f})'
+            })
+
+        # --- Phase 2: RF device fingerprinting ---
+        expected_device = user['device_id']
+
+        if expected_device not in device_features_db:
+            log_attempt(claimed_user, face_similarity, expected_device, 'DENIED')
+            return jsonify({
+                'final_verdict': 'DENIED',
+                'phase1': {'status': 'PASSED', 'similarity': face_similarity},
+                'phase2': {'status': 'FAILED'},
+                'message': f'Device {expected_device} not found in RF database'
+            })
+
+        rf_features = device_features_db[expected_device].reshape(1, -1)
+        predicted_device_idx = rf_model.predict(rf_features)[0]
+        predicted_device = rf_label_encoder.inverse_transform([predicted_device_idx])[0]
+
+        print(f"Expected: {expected_device}, Predicted: {predicted_device}")
+
+        if predicted_device != expected_device:
+            log_attempt(claimed_user, face_similarity, expected_device, 'DENIED')
+            return jsonify({
+                'final_verdict': 'DENIED',
+                'phase1': {'status': 'PASSED', 'similarity': face_similarity},
+                'phase2': {'status': 'FAILED', 'expected': expected_device, 'predicted': predicted_device},
+                'message': 'Device mismatch'
+            })
+
+        log_attempt(claimed_user, face_similarity, expected_device, 'GRANTED')
+        return jsonify({
+            'final_verdict': 'GRANTED',
+            'phase1': {'status': 'PASSED', 'similarity': face_similarity},
+            'phase2': {'status': 'PASSED', 'device_id': expected_device},
+            'message': 'Access granted'
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# Public endpoint: list users (names only, for dropdown)
+# ============================================================
+
+@app.route('/users', methods=['GET'])
+def get_users():
+    db = get_db()
+    users = db.execute("SELECT name, device_id FROM users").fetchall()
+    return jsonify([{'name': u['name'], 'device_id': u['device_id']} for u in users])
+
+
+# ============================================================
+# Face enrollment endpoints (protected)
+# ============================================================
+
+@app.route('/enroll_face_temp', methods=['POST'])
+@require_admin
+def enroll_face_temp():
+    try:
+        data = request.json
+        face_base64 = data.get('face_image')
+
+        frame = decode_image_from_base64(face_base64)
+        if frame is None:
+            return jsonify({'error': 'Failed to decode image'}), 400
+
+        face_emb = get_face_embedding(frame)
+        if face_emb is None:
+            return jsonify({'error': 'No face detected'}), 400
+
+        return jsonify({'embedding': face_emb.tolist()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/save_face_embedding', methods=['POST'])
+@require_admin
+def save_face_embedding():
+    try:
+        data = request.json
+        username = data.get('username')
+        embedding = data.get('embedding')
+
+        embedding_array = np.array(embedding, dtype=np.float32)
+        # Store as raw float32 bytes — portable across numpy versions
+        embedding_bytes = embedding_array.tobytes()
+
+        db = get_db()
+        db.execute(
+            "UPDATE users SET face_embedding = ? WHERE name = ?",
+            (embedding_bytes, username)
+        )
+        db.commit()
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================
+# Admin endpoints (all protected by require_admin)
+# ============================================================
+
+@app.route('/admin/stats', methods=['GET'])
+@require_admin
+def admin_stats():
+    db = get_db()
+    total_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_attempts = db.execute("SELECT COUNT(*) FROM auth_log").fetchone()[0]
+    success_count = db.execute(
+        "SELECT COUNT(*) FROM auth_log WHERE final_decision = 'GRANTED'"
+    ).fetchone()[0]
+    success_rate = (success_count / total_attempts * 100) if total_attempts > 0 else 0
+
+    return jsonify({
+        'total_users': total_users,
+        'total_attempts': total_attempts,
+        'success_rate': round(success_rate, 1),
+        'total_rf_devices': len(device_features_db)
+    })
+
+
+@app.route('/admin/users', methods=['GET'])
+@require_admin
+def admin_users():
+    db = get_db()
+    users = db.execute(
+        "SELECT user_id, name, device_id, enrollment_date, face_embedding FROM users"
+    ).fetchall()
+
+    result = []
+    for u in users:
+        has_face = 'no'
+        if u['face_embedding'] is not None:
+            try:
+                emb = np.frombuffer(u['face_embedding'], dtype=np.float32)
+                has_face = 'yes' if len(emb) > 0 else 'no'
+            except Exception:
+                has_face = 'no'
+        result.append({
+            'user_id': u['user_id'],
+            'name': u['name'],
+            'device_id': u['device_id'],
+            'enrolled_date': u['enrollment_date'],
+            'has_face': has_face
+        })
+    return jsonify(result)
+
+
+@app.route('/admin/logs', methods=['GET'])
+@require_admin
+def admin_logs():
+    db = get_db()
+    logs = db.execute(
+        "SELECT timestamp, user_name, face_score, device_id, final_decision "
+        "FROM auth_log ORDER BY timestamp DESC LIMIT 100"
+    ).fetchall()
+    return jsonify([{
+        'timestamp': l['timestamp'],
+        'user_name': l['user_name'],
+        'face_score': l['face_score'],
+        'device_id': l['device_id'],
+        'final_decision': l['final_decision']
+    } for l in logs])
+
+
+@app.route('/admin/rf_devices', methods=['GET'])
+@require_admin
+def admin_rf_devices():
+    return jsonify([
+        {'mac': mac, 'features_count': len(features)}
+        for mac, features in device_features_db.items()
+    ])
+
+
+@app.route('/admin/delete_user/<int:user_id>', methods=['DELETE'])
+@require_admin
+def admin_delete_user(user_id):
+    db = get_db()
+    user = db.execute("SELECT name FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if user:
+        db.execute("DELETE FROM auth_log WHERE user_name = ?", (user['name'],))
+        db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        db.commit()
+        return jsonify({'status': 'ok'})
+    return jsonify({'error': 'User not found'}), 404
+
+
+@app.route('/admin/clear_logs', methods=['DELETE'])
+@require_admin
+def admin_clear_logs():
+    db = get_db()
+    db.execute("DELETE FROM auth_log")
+    db.commit()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/admin/add_user', methods=['POST'])
+@require_admin
+def admin_add_user():
+    data = request.json
+    name = data.get('name', '').strip()
+    device_id = data.get('device_id', '').strip()
+
+    if not name or not device_id:
+        return jsonify({'error': 'name and device_id are required'}), 400
+
+    db = get_db()
+    try:
+        # Placeholder embedding: zeros as raw float32 bytes
+        placeholder = np.zeros(512, dtype=np.float32).tobytes()
+        db.execute(
+            "INSERT INTO users (name, device_id, face_embedding) VALUES (?, ?, ?)",
+            (name, device_id, placeholder)
+        )
+        db.commit()
+        return jsonify({'status': 'ok'})
+    except sqlite3.IntegrityError:
+        return jsonify({'error': f'User "{name}" already exists'}), 409
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=PORT, debug=DEBUG)
+
+
+# ============================================================
+# FILE 4: enroll.py  (offline face enrollment via webcam)
+# ============================================================
+
+import cv2
+import numpy as np
+import sqlite3
+import time
+from insightface.app import FaceAnalysis
+
+from config import DB_PATH, FACE_MODEL_NAME, FACE_DET_SIZE
+from setup_database import setup_database
+
+# Ensure DB and schema exist
+setup_database()
+
+face_app = FaceAnalysis(name=FACE_MODEL_NAME)
+face_app.prepare(ctx_id=0, det_size=FACE_DET_SIZE)
+
+cap = cv2.VideoCapture(0)
+
+
+def get_face_embedding(frame):
+    faces = face_app.get(frame)
+    return faces[0].embedding if faces else None
+
+
+print("=== Face Enrollment ===")
+user_name = input("Enter user name: ").strip()
+device_id = input(f"Enter device MAC address for {user_name}: ").strip()
+
+embeddings = []
+print("Look at camera. Capturing 10 images...")
+
+for i in range(10):
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera error")
+        break
+
+    embedding = get_face_embedding(frame)
+    label_text = f"Captured {i+1}/10" if embedding is not None else "No face detected"
+    label_color = (0, 255, 0) if embedding is not None else (0, 0, 255)
+
+    if embedding is not None:
+        embeddings.append(embedding)
+        print(f"  Image {i+1}/10 captured")
+    else:
+        print(f"  Image {i+1}/10 failed - no face detected")
+
+    cv2.putText(frame, label_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, label_color, 2)
+    cv2.imshow('Enrollment', frame)
+    cv2.waitKey(500)
+    time.sleep(0.5)
+
+cap.release()
+cv2.destroyAllWindows()
+
+if len(embeddings) >= 5:
+    avg_embedding = np.mean(embeddings, axis=0).astype(np.float32)
+    # Store as portable raw bytes instead of pickle
+    embedding_bytes = avg_embedding.tobytes()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO users (name, face_embedding, device_id) VALUES (?, ?, ?)",
+            (user_name, embedding_bytes, device_id)
+        )
+        conn.commit()
+        print(f"\n✅ {user_name} enrolled successfully!")
+        print(f"   Face embedding shape: {avg_embedding.shape}")
+        print(f"   Device: {device_id}")
+    except sqlite3.IntegrityError:
+        print(f"\n⚠️  User '{user_name}' already exists. Updating face embedding...")
+        conn.execute(
+            "UPDATE users SET face_embedding = ?, device_id = ? WHERE name = ?",
+            (embedding_bytes, device_id, user_name)
+        )
+        conn.commit()
+        print(f"✅ {user_name} updated successfully!")
+    finally:
+        conn.close()
+else:
+    print(f"\n❌ Enrollment failed. Only {len(embeddings)} valid faces captured (need at least 5).")
+
+
+# ============================================================
+# FILE 5: extract_features.py
+# ============================================================
+
+import pandas as pd
+import numpy as np
+import os
+import pickle
+from config import ALL_FEATURES_PATH
+
+# --- Configure these paths via environment or edit here ---
+DATASET_PATH = os.environ.get('RFFI_DATASET_PATH', './FE-Dataset')
+OUTPUT_PATH = os.path.dirname(ALL_FEATURES_PATH)
+
+os.makedirs(OUTPUT_PATH, exist_ok=True)
+
+FEATURE_COLS = [
+    'CFO', 'short_freq', 'long_freq', 'frac_dimension_1', 'frac_dimension_2',
+    'iqi_1', 'iqi_2', 'mag_error_mean_1', 'mag_error_var_1',
+    'mag_error_mean_2', 'mag_error_var_2', 'phase_error_mean_1',
+    'phase_error_var_1', 'phase_error_mean_2', 'phase_error_var_2'
+]
+
+files = [f for f in os.listdir(DATASET_PATH) if f.endswith('.csv')]
+device_features = {}
+failed = 0
+
+for file in files:
+    filepath = os.path.join(DATASET_PATH, file)
+    try:
+        df = pd.read_csv(filepath)
+
+        mac_cols = [col for col in df.columns if 'MAC' in col.upper()]
+        if mac_cols:
+            mac = str(df[mac_cols[0]].iloc[0]).replace(':', '_')
+        else:
+            mac = file.replace('_pre.csv', '').replace('.csv', '')
+            print(f"Using filename as MAC: {mac}")
+
+        available_cols = [col for col in FEATURE_COLS if col in df.columns]
+        if not available_cols:
+            print(f"⚠️  {file}: No feature columns found, skipping...")
+            failed += 1
+            continue
+
+        avg_features = df[available_cols].values.mean(axis=0)
+        device_features[mac] = avg_features
+
+        # Save individual device file
+        device_out = os.path.join(OUTPUT_PATH, f"{mac}_features.pkl")
+        with open(device_out, 'wb') as f:
+            pickle.dump(avg_features, f)
+
+        print(f"✅ {mac}: {len(avg_features)} features from {len(df)} rows")
+
+    except Exception as e:
+        print(f"❌ Error in {file}: {e}")
+        failed += 1
+
+print(f"\n✅ Total devices: {len(device_features)}")
+print(f"❌ Failed: {failed}")
+
+if device_features:
+    with open(ALL_FEATURES_PATH, 'wb') as f:
+        pickle.dump(device_features, f)
+    print(f"✅ Saved to {ALL_FEATURES_PATH}")
+else:
+    print("❌ No features extracted — check RFFI_DATASET_PATH")
+
+
+# ============================================================
+# FILE 6: user_dashboard.html
+# ============================================================
+
+<!doctype html>
+<html>
+  <head>
+    <title>Two-Factor Authentication Demo</title>
+    <style>
+      body { font-family: Arial, sans-serif; text-align: center; padding: 20px; }
+      video { border: 2px solid #333; border-radius: 10px; margin: 20px; }
+      button { padding: 10px 30px; font-size: 18px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+      button:hover { background-color: #0056b3; }
+      button:disabled { background-color: #aaa; cursor: not-allowed; }
+      .granted { color: green; font-size: 24px; font-weight: bold; margin: 20px; }
+      .denied { color: red; font-size: 24px; font-weight: bold; margin: 20px; }
+      .details { background-color: #f0f0f0; padding: 15px; border-radius: 10px; margin: 20px auto; width: 50%; text-align: left; font-family: monospace; }
+      select { padding: 10px; font-size: 16px; margin: 10px; }
+    </style>
+  </head>
+  <body>
+    <h1>🔐 Two-Factor Authentication System</h1>
+    <h3>Face Recognition + RF Fingerprinting</h3>
+
+    <video id="video" width="640" height="480" autoplay muted></video>
+    <br />
+
+    <!-- User list is populated dynamically from the /users endpoint -->
+    <select id="userSelect">
+      <option value="">Loading users...</option>
+    </select>
+
+    <button id="authBtn">🔍 Authenticate</button>
+
+    <div id="result"></div>
+
+    <script>
+      const API_URL = "http://localhost:5000";
+      const video = document.getElementById("video");
+
+      // Start camera
+      navigator.mediaDevices
+        .getUserMedia({ video: true })
+        .then((stream) => (video.srcObject = stream))
+        .catch((err) => {
+          console.error(err);
+          document.getElementById("result").innerHTML =
+            '<div class="denied">Camera error: ' + err.message + "</div>";
+        });
+
+      // Populate user dropdown dynamically
+      async function loadUsers() {
+        try {
+          const res = await fetch(`${API_URL}/users`);
+          const users = await res.json();
+          const select = document.getElementById("userSelect");
+          select.innerHTML = "";
+          if (users.length === 0) {
+            select.innerHTML = '<option value="">No users enrolled</option>';
+            return;
+          }
+          users.forEach((u) => {
+            const opt = document.createElement("option");
+            opt.value = u.name;
+            opt.textContent = u.name;
+            select.appendChild(opt);
+          });
+        } catch (err) {
+          console.error("Failed to load users:", err);
+        }
+      }
+
+      loadUsers();
+
+      document.getElementById("authBtn").addEventListener("click", async () => {
+        const btn = document.getElementById("authBtn");
+        btn.disabled = true;
+        btn.textContent = "Authenticating...";
+
+        try {
+          // Small delay for camera to settle
+          await new Promise((r) => setTimeout(r, 300));
+
+          const canvas = document.createElement("canvas");
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          canvas.getContext("2d").drawImage(video, 0, 0);
+          const imageData = canvas.toDataURL("image/jpeg");
+
+          const claimedUser = document.getElementById("userSelect").value;
+          if (!claimedUser) {
+            alert("Please select a user first.");
+            return;
+          }
+
+          const response = await fetch(`${API_URL}/authenticate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ face_image: imageData, claimed_user: claimedUser }),
+          });
+
+          const result = await response.json();
+
+          if (result.final_verdict === "GRANTED") {
+            document.getElementById("result").innerHTML = `
+              <div class="granted">✅ ACCESS GRANTED</div>
+              <div class="details">
+                <strong>📊 Authentication Details:</strong><br>
+                Phase 1 (Face): ${result.phase1.status}<br>
+                Face Similarity: ${(result.phase1.similarity * 100).toFixed(2)}%<br>
+                Phase 2 (RF): ${result.phase2.status}<br>
+                Device ID: ${result.phase2.device_id}<br>
+                <span style="color:green;">✓ Both factors verified successfully</span>
+              </div>`;
+          } else {
+            document.getElementById("result").innerHTML = `
+              <div class="denied">❌ ACCESS DENIED</div>
+              <div class="details">
+                <strong>📊 Authentication Details:</strong><br>
+                Phase 1 (Face): ${result.phase1?.status || "FAILED"}<br>
+                Face Similarity: ${result.phase1?.similarity != null ? (result.phase1.similarity * 100).toFixed(2) + "%" : "N/A"}<br>
+                Phase 2 (RF): ${result.phase2?.status || "SKIPPED"}<br>
+                ${result.phase2?.expected ? "Expected Device: " + result.phase2.expected + "<br>" : ""}
+                ${result.phase2?.predicted ? "Predicted Device: " + result.phase2.predicted + "<br>" : ""}
+                <span style="color:red;">✗ ${result.message || "Authentication failed"}</span>
+              </div>`;
+          }
+        } catch (err) {
+          document.getElementById("result").innerHTML =
+            '<div class="denied">Network error: ' + err.message + "</div>";
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "🔍 Authenticate";
+        }
+      });
+    </script>
+  </body>
+</html>
+
+
+# ============================================================
+# FILE 7: admin_dashboard.html
+# ============================================================
+
+<!doctype html>
+<html>
+  <head>
+    <title>Admin Dashboard - Authentication System</title>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5; }
+      h1 { color: #333; border-bottom: 3px solid #007bff; padding-bottom: 10px; }
+      h2 { color: #555; margin-top: 30px; }
+      table { width: 100%; border-collapse: collapse; background-color: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 30px; }
+      th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+      th { background-color: #007bff; color: white; }
+      tr:hover { background-color: #f1f1f1; }
+      .granted { color: green; font-weight: bold; }
+      .denied { color: red; font-weight: bold; }
+      .card { background-color: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+      .stat { display: inline-block; width: 200px; margin: 10px; padding: 15px; background-color: #007bff; color: white; border-radius: 10px; text-align: center; }
+      .stat-number { font-size: 28px; font-weight: bold; }
+      button { padding: 10px 20px; margin: 5px; cursor: pointer; border: none; border-radius: 5px; }
+      .refresh-btn { background-color: #28a745; color: white; }
+      .delete-btn { background-color: #dc3545; color: white; }
+      .delete-btn:hover { background-color: #c82333; }
+      .enroll-btn { background-color: #ffc107; color: #333; }
+      .enroll-btn:hover { background-color: #e0a800; }
+      input { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 5px; }
+      #tokenWarning { background: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 5px; margin-bottom: 15px; }
+    </style>
+  </head>
+  <body>
+    <h1>🔐 Admin Dashboard</h1>
+    <p>Authentication System Monitor</p>
+
+    <!-- Admin token input -->
+    <div class="card">
+      <h2>🔑 Admin Access</h2>
+      <div id="tokenWarning">Enter your admin token to use protected endpoints.</div>
+      <input type="password" id="adminToken" placeholder="Admin Token" style="width:300px;" />
+      <button class="refresh-btn" onclick="saveToken()">Set Token</button>
+    </div>
+
+    <div class="card">
+      <h2>📊 System Statistics</h2>
+      <div id="stats">
+        <div class="stat"><div class="stat-number" id="totalUsers">—</div><div>Total Users</div></div>
+        <div class="stat"><div class="stat-number" id="totalAttempts">—</div><div>Total Attempts</div></div>
+        <div class="stat"><div class="stat-number" id="successRate">—</div><div>Success Rate</div></div>
+        <div class="stat"><div class="stat-number" id="totalDevices">—</div><div>RF Devices</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>👥 Registered Users</h2>
+      <button class="refresh-btn" onclick="loadUsers()">🔄 Refresh</button>
+      <button class="refresh-btn" onclick="showAddUserForm()">➕ Add User</button>
+      <div id="addUserForm" style="display:none; margin-top:15px;">
+        <input type="text" id="newUserName" placeholder="Username" />
+        <input type="text" id="newUserDevice" placeholder="Device MAC" />
+        <button onclick="addUser()">Save</button>
+        <button onclick="hideAddUserForm()">Cancel</button>
+      </div>
+      <table id="usersTable">
+        <thead><tr><th>ID</th><th>Username</th><th>Device ID</th><th>Enrolled</th><th>Face Status</th><th>Actions</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>📜 Authentication Log</h2>
+      <button class="refresh-btn" onclick="loadLogs()">🔄 Refresh</button>
+      <button class="delete-btn" onclick="clearLogs()">🗑️ Clear Logs</button>
+      <table id="logsTable">
+        <thead><tr><th>Time</th><th>User</th><th>Face Score</th><th>Device</th><th>Decision</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>🖥️ RF Devices Database</h2>
+      <button class="refresh-btn" onclick="loadRFDevices()">🔄 Refresh</button>
+      <table id="rfDevicesTable">
+        <thead><tr><th>Device MAC</th><th>Features Count</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <script>
+      const API_URL = "http://localhost:5000";
+      let adminToken = sessionStorage.getItem("adminToken") || "";
+
+      function saveToken() {
+        adminToken = document.getElementById("adminToken").value.trim();
+        sessionStorage.setItem("adminToken", adminToken);
+        document.getElementById("tokenWarning").textContent = "Token set. Loading data...";
+        document.getElementById("tokenWarning").style.background = "#d4edda";
+        loadAll();
+      }
+
+      function adminHeaders() {
+        return {
+          "Content-Type": "application/json",
+          "X-Admin-Token": adminToken
+        };
+      }
+
+      function handleUnauthorized(res) {
+        if (res.status === 401) {
+          document.getElementById("tokenWarning").textContent = "❌ Invalid token. Please re-enter.";
+          document.getElementById("tokenWarning").style.background = "#f8d7da";
+          return true;
+        }
+        return false;
+      }
+
+      function loadStats() {
+        fetch(`${API_URL}/admin/stats`, { headers: adminHeaders() })
+          .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+          .then((data) => {
+            document.getElementById("totalUsers").innerText = data.total_users ?? "—";
+            document.getElementById("totalAttempts").innerText = data.total_attempts ?? "—";
+            document.getElementById("successRate").innerText = (data.success_rate ?? "—") + "%";
+            document.getElementById("totalDevices").innerText = data.total_rf_devices ?? "—";
+          })
+          .catch((err) => console.error("Stats error:", err));
+      }
+
+      function loadUsers() {
+        fetch(`${API_URL}/admin/users`, { headers: adminHeaders() })
+          .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+          .then((users) => {
+            const tbody = document.querySelector("#usersTable tbody");
+            tbody.innerHTML = "";
+            users.forEach((user) => {
+              const row = tbody.insertRow();
+              row.insertCell(0).innerText = user.user_id;
+              row.insertCell(1).innerText = user.name;
+              row.insertCell(2).innerText = user.device_id;
+              row.insertCell(3).innerText = new Date(user.enrolled_date).toLocaleString();
+              const faceCell = row.insertCell(4);
+              faceCell.innerHTML = user.has_face === "yes"
+                ? '<span style="color:green;">✅ Enrolled</span>'
+                : '<span style="color:orange;">⚠️ Pending</span>';
+              const actions = row.insertCell(5);
+              actions.innerHTML = `
+                <button class="enroll-btn" onclick="enrollFace('${user.name}', '${user.device_id}')">📸 Enroll Face</button>
+                <button class="delete-btn" onclick="deleteUser(${user.user_id})">Delete</button>`;
+            });
+          })
+          .catch((err) => console.error("Users error:", err));
+      }
+
+      function enrollFace(username, deviceId) {
+        const enrollWindow = window.open("", "_blank", "width=800,height=650");
+        const token = adminToken;
+        enrollWindow.document.write(`
+          <html><head><title>Face Enrollment - ${username}</title>
+          <style>
+            body{font-family:Arial;text-align:center;padding:20px;}
+            video{border:2px solid #333;margin:20px;}
+            button{padding:10px 30px;font-size:16px;background:#007bff;color:white;border:none;border-radius:5px;cursor:pointer;}
+            .status{margin:20px;font-size:18px;} .success{color:green;} .error{color:red;}
+          </style></head><body>
+          <h2>Face Enrollment for ${username}</h2>
+          <p>Device MAC: ${deviceId}</p>
+          <video id="video" width="640" height="480" autoplay muted></video><br>
+          <button id="enrollBtn">Start Enrollment (10 photos)</button>
+          <div id="status" class="status"></div>
+          <script>
+            const video = document.getElementById('video');
+            const statusDiv = document.getElementById('status');
+            navigator.mediaDevices.getUserMedia({video:true})
+              .then(s => video.srcObject = s)
+              .catch(e => statusDiv.innerHTML = '<span class="error">Camera error: '+e.message+'</span>');
+
+            document.getElementById('enrollBtn').onclick = async () => {
+              statusDiv.innerHTML = 'Capturing 10 photos...';
+              const embeddings = [];
+              for (let i = 0; i < 10; i++) {
+                await new Promise(r => setTimeout(r, 500));
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0);
+                const imageData = canvas.toDataURL('image/jpeg');
+                const res = await fetch('http://localhost:5000/enroll_face_temp', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json','X-Admin-Token':'${token}'},
+                  body: JSON.stringify({face_image: imageData, username: '${username}'})
+                });
+                const result = await res.json();
+                if (result.embedding) {
+                  embeddings.push(result.embedding);
+                  statusDiv.innerHTML = 'Captured ' + (i+1) + '/10';
+                } else {
+                  statusDiv.innerHTML = 'Failed ' + (i+1) + '/10 - no face detected';
+                }
+              }
+              if (embeddings.length >= 5) {
+                const len = embeddings[0].length;
+                const avg = Array.from({length: len}, (_, j) =>
+                  embeddings.reduce((s, e) => s + e[j], 0) / embeddings.length);
+                const saveRes = await fetch('http://localhost:5000/save_face_embedding', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json','X-Admin-Token':'${token}'},
+                  body: JSON.stringify({username:'${username}', embedding: avg})
+                });
+                if (saveRes.ok) {
+                  statusDiv.innerHTML = '<span class="success">✅ Enrollment successful! Closing...</span>';
+                  setTimeout(() => window.close(), 2000);
+                } else {
+                  statusDiv.innerHTML = '<span class="error">❌ Failed to save embedding</span>';
+                }
+              } else {
+                statusDiv.innerHTML = '<span class="error">❌ Only ' + embeddings.length + ' valid faces. Need 5+.</span>';
+              }
+            };
+          <\/script></body></html>`);
+      }
+
+      function loadLogs() {
+        fetch(`${API_URL}/admin/logs`, { headers: adminHeaders() })
+          .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+          .then((logs) => {
+            const tbody = document.querySelector("#logsTable tbody");
+            tbody.innerHTML = "";
+            logs.forEach((log) => {
+              const row = tbody.insertRow();
+              row.insertCell(0).innerText = new Date(log.timestamp).toLocaleString();
+              row.insertCell(1).innerText = log.user_name;
+              row.insertCell(2).innerText = log.face_score != null ? (log.face_score * 100).toFixed(1) + "%" : "N/A";
+              row.insertCell(3).innerText = log.device_id || "N/A";
+              const decision = row.insertCell(4);
+              decision.innerHTML = log.final_decision === "GRANTED"
+                ? '<span class="granted">✅ GRANTED</span>'
+                : '<span class="denied">❌ DENIED</span>';
+            });
+          })
+          .catch((err) => console.error("Logs error:", err));
+      }
+
+      function loadRFDevices() {
+        fetch(`${API_URL}/admin/rf_devices`, { headers: adminHeaders() })
+          .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+          .then((devices) => {
+            const tbody = document.querySelector("#rfDevicesTable tbody");
+            tbody.innerHTML = "";
+            devices.forEach((device) => {
+              const row = tbody.insertRow();
+              row.insertCell(0).innerText = device.mac;
+              row.insertCell(1).innerText = device.features_count;
+            });
+          })
+          .catch((err) => console.error("RF devices error:", err));
+      }
+
+      function deleteUser(userId) {
+        if (confirm("Delete this user? This will also delete their auth logs.")) {
+          fetch(`${API_URL}/admin/delete_user/${userId}`, { method: "DELETE", headers: adminHeaders() })
+            .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+            .then(() => { loadUsers(); loadStats(); })
+            .catch((err) => console.error("Delete error:", err));
+        }
+      }
+
+      function clearLogs() {
+        if (confirm("Clear all authentication logs?")) {
+          fetch(`${API_URL}/admin/clear_logs`, { method: "DELETE", headers: adminHeaders() })
+            .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+            .then(() => loadLogs())
+            .catch((err) => console.error("Clear logs error:", err));
+        }
+      }
+
+      function showAddUserForm() { document.getElementById("addUserForm").style.display = "block"; }
+      function hideAddUserForm() {
+        document.getElementById("addUserForm").style.display = "none";
+        document.getElementById("newUserName").value = "";
+        document.getElementById("newUserDevice").value = "";
+      }
+
+      function addUser() {
+        const name = document.getElementById("newUserName").value.trim();
+        const device_id = document.getElementById("newUserDevice").value.trim();
+        if (!name || !device_id) { alert("Please enter both username and device MAC"); return; }
+        fetch(`${API_URL}/admin/add_user`, {
+          method: "POST",
+          headers: adminHeaders(),
+          body: JSON.stringify({ name, device_id })
+        })
+          .then((res) => { if (handleUnauthorized(res)) throw new Error("Unauthorized"); return res.json(); })
+          .then((data) => {
+            if (data.error) alert(data.error);
+            else { alert("User added. Click Enroll Face to complete enrollment."); loadUsers(); loadStats(); hideAddUserForm(); }
+          })
+          .catch((err) => console.error("Add user error:", err));
+      }
+
+      function loadAll() { loadStats(); loadUsers(); loadLogs(); loadRFDevices(); }
+
+      // Auto-refresh stats and logs every 10 seconds
+      setInterval(() => { if (adminToken) { loadStats(); loadLogs(); } }, 10000);
+
+      // If token is already stored, load immediately
+      if (adminToken) {
+        document.getElementById("adminToken").value = adminToken;
+        document.getElementById("tokenWarning").textContent = "Token loaded from session. Loading data...";
+        document.getElementById("tokenWarning").style.background = "#d4edda";
+        loadAll();
+      }
+    </script>
+  </body>
+</html>

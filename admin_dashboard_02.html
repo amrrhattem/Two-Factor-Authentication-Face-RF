@@ -548,7 +548,7 @@
 
       function handleUnauthorized(res) {
         if (res.status === 401) {
-          setBanner("❌ Invalid token — please re-enter.", "err");
+          setBanner(" Invalid token — please re-enter.", "err");
           return true;
         }
         return false;
@@ -609,29 +609,38 @@
             }
             users.forEach((user) => {
               const tr = document.createElement("tr");
-              const enrolledDate = user.enrolled_date
-                ? new Date(user.enrolled_date).toLocaleString()
-                : "—";
-              const faceStatus =
-                user.has_face === "yes"
-                  ? '<span class="badge badge-green">✓ Enrolled</span>'
-                  : '<span class="badge badge-amber">⏳ Pending</span>';
+
+              // إصلاح الوقت
+              let enrolledDate = "—";
+              if (user.enrolled_date) {
+                const dateFixed = user.enrolled_date.replace(" ", "T");
+                enrolledDate = new Date(dateFixed).toLocaleString();
+              }
+
+              const hasFace = user.has_face === "yes" || user.has_face === true;
+
+              const faceStatus = hasFace
+                ? '<span class="badge badge-green">✓ Enrolled</span>'
+                : '<span class="badge badge-amber">⏳ Pending</span>';
+
+              const displayId = user.display_id || user.user_id; // لو مفيش display_id، استخدم user_id
+
               tr.innerHTML = `
-                <td>${user.user_id}</td>
-                <td>${user.name}</td>
-                <td>${user.device_id}</td>
-                <td>${enrolledDate}</td>
-                <td>${faceStatus}</td>
-                <td style="display:flex;gap:6px;flex-wrap:wrap;">
-                  <button class="btn-warning"
-                    onclick="enrollFace('${escHtml(user.name)}', '${escHtml(user.device_id)}')">
-                    📸 Enroll Face
-                  </button>
-                  <button class="btn-danger"
-                    onclick="deleteUser(${user.user_id})">
-                    Delete
-                  </button>
-                </td>`;
+          <td>${displayId}</td>
+          <td>${user.name}</td>
+          <td>${user.device_id}</td>
+          <td>${enrolledDate}</td>
+          <td>${faceStatus}</td>
+          <td style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn-warning"
+              onclick="enrollFace('${escHtml(user.name)}', '${escHtml(user.device_id)}')">
+               Enroll Face
+            </button>
+            <button class="btn-danger"
+              onclick="deleteUser(${user.user_id})">  
+              Delete
+            </button>
+          </td>`;
               tbody.appendChild(tr);
             });
           })
@@ -733,15 +742,15 @@
         body: JSON.stringify({ username: '${username}', embedding: avg })
       });
       if (saveRes.ok) {
-        statusEl.innerHTML = '<span class="ok">✅ Enrollment complete! This window will close.</span>';
+        statusEl.innerHTML = '<span class="ok"> Enrollment complete! This window will close.</span>';
         setTimeout(() => window.close(), 2000);
       } else {
         const errData = await saveRes.json().catch(() => ({}));
-        statusEl.innerHTML = '<span class="err">❌ Failed to save: ' + (errData.error || saveRes.status) + '</span>';
+        statusEl.innerHTML = '<span class="err"> Failed to save: ' + (errData.error || saveRes.status) + '</span>';
         btn.disabled = false;
       }
     } catch (saveErr) {
-      statusEl.innerHTML = '<span class="err">❌ Network error while saving.</span>';
+      statusEl.innerHTML = '<span class="err"> Network error while saving.</span>';
       btn.disabled = false;
     }
   });

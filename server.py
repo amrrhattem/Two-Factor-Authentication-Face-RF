@@ -10,7 +10,7 @@ from flask_cors import CORS
 import base64
 import joblib
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config import (
     DB_PATH, RF_MODEL_PATH, LABEL_ENCODER_PATH, ALL_FEATURES_PATH,
@@ -38,7 +38,7 @@ print("Loading device features...")
 with open(ALL_FEATURES_PATH, 'rb') as f:
     device_features_db = pickle.load(f)
 
-print(f"✅ Server ready. {len(device_features_db)} RF devices loaded.")
+print(f" Server ready. {len(device_features_db)} RF devices loaded.")
 
 
 # ============================================================
@@ -291,29 +291,44 @@ def admin_stats():
 def admin_users():
     db = get_db()
     users = db.execute(
-        "SELECT user_id, name, device_id, enrollment_date, face_embedding FROM users"
+        "SELECT user_id, name, device_id, enrollment_date, face_embedding FROM users ORDER BY enrollment_date ASC"
     ).fetchall()
 
     result = []
-    for u in users:
+    for idx, u in enumerate(users, start=1):
         has_face = 'no'
-        if u['face_embedding'] is not None:
+        
+        if u['face_embedding'] and len(u['face_embedding']) > 0:
             try:
                 emb = np.frombuffer(u['face_embedding'], dtype=np.float32)
-                has_face = 'yes' if len(emb) > 0 else 'no'
+                if len(emb) > 0 and not np.allclose(emb, np.zeros_like(emb), atol=1e-6):
+                    has_face = 'yes'
+                else:
+                    has_face = 'no'
             except Exception:
                 has_face = 'no'
+        
+        enrolled_date = u['enrollment_date']
+        if enrolled_date:
+            try:
+                db_time = datetime.strptime(enrolled_date, "%Y-%m-%d %H:%M:%S")
+                egypt_time = db_time + timedelta(hours=3)
+                enrolled_date = egypt_time.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                pass
+                
         result.append({
+            'display_id': idx,
             'user_id': u['user_id'],
             'name': u['name'],
             'device_id': u['device_id'],
-            'enrolled_date': u['enrollment_date'],
+            'enrolled_date': enrolled_date,
             'has_face': has_face
         })
     return jsonify(result)
 
 
-@app.route('/admin/logs', methods=['GET'])
+@app.route("/admin/logs", methods=["GET"])
 @require_admin
 def admin_logs():
     db = get_db()
@@ -321,13 +336,30 @@ def admin_logs():
         "SELECT timestamp, user_name, face_score, device_id, final_decision "
         "FROM auth_log ORDER BY timestamp DESC LIMIT 100"
     ).fetchall()
-    return jsonify([{
-        'timestamp': l['timestamp'],
-        'user_name': l['user_name'],
-        'face_score': l['face_score'],
-        'device_id': l['device_id'],
-        'final_decision': l['final_decision']
-    } for l in logs])
+
+    formatted_logs = []
+    for l in logs:
+        # قراءة الوقت النصي من قاعدة البيانات وتحويله لكائن datetime
+        try:
+            db_time = datetime.strptime(l["timestamp"], "%Y-%m-%d %H:%M:%S")
+            # إضافة 3 ساعات ليطابق توقيت مصر
+            egypt_time = db_time + timedelta(hours=3)
+            timestamp_str = egypt_time.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            # في حال وجود صيغة وقت مختلفة أو قيمة فارغة احتياطياً
+            timestamp_str = l["timestamp"]
+
+        formatted_logs.append(
+            {
+                "timestamp": timestamp_str,
+                "user_name": l["user_name"],
+                "face_score": l["face_score"],
+                "device_id": l["device_id"],
+                "final_decision": l["final_decision"],
+            }
+        )
+
+    return jsonify(formatted_logs)
 
 
 @app.route('/admin/rf_devices', methods=['GET'])
@@ -372,17 +404,32 @@ def admin_add_user():
         return jsonify({'error': 'name and device_id are required'}), 400
 
     db = get_db()
+    
+    existing_user = db.execute(
+        "SELECT name FROM users WHERE device_id = ?", 
+        (device_id,)
+    ).fetchone()
+    
+    if existing_user:
+        return jsonify({
+            'error': f'Device {device_id} is already assigned to user "{existing_user["name"]}"'
+        }), 409
+    
+    existing_name = db.execute(
+        "SELECT name FROM users WHERE name = ?", 
+        (name,)
+    ).fetchone()
+    
+    if existing_name:
+        return jsonify({'error': f'User "{name}" already exists'}), 409
+
     try:
-        # Placeholder embedding: zeros as raw float32 bytes
-        placeholder = sqlite3.Binary(np.zeros(512, dtype=np.float32).tobytes())
         db.execute(
             "INSERT INTO users (name, device_id, face_embedding) VALUES (?, ?, ?)",
-            (name, device_id, placeholder)
+            (name, device_id, None)
         )
         db.commit()
         return jsonify({'status': 'ok'})
-    except sqlite3.IntegrityError:
-        return jsonify({'error': f'User "{name}" already exists'}), 409
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
